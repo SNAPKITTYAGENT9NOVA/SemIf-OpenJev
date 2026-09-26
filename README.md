@@ -123,6 +123,50 @@ INDEPENDENTLY VERIFIED.
 | 27B at 5.0 bits per weight (exl3) | [`exl3-bridge/`](exl3-bridge/README.md) | BENCHMARKED | Committed row-level results with SHA256SUMS: `authored144` balanced accuracy 0.9579 (pinned 4B BF16: 0.813); `shape777` argmax agreement 0.8443 with the 4B BF16 predictions (121 flips). Model family and quantization both differ, so this is **not** a quantization ablation |
 | Quantized Hilbert 4B | — | PROPOSED | The engine's GGUF loader reads Llama-architecture files only. The Qwen3.5 hybrid layers (Gated DeltaNet and gated attention) need loader and kernel support before a quantized Hilbert 4B can run through the CUDA backend |
 | Full 8B GGUF run end to end | — | PROPOSED | Tokenizer and prompts of a released Llama 3 8B Instruct Q4_K_M match Hugging Face; the full forward pass on that file has not been run |
+| Prune-then-quantize helpers (PyTorch, INT8) | [sovereign-engine-v2](https://github.com/SNAPKITTYWEST/sovereign-engine-v2) (external) | IMPLEMENTED, does not run as written | See below |
+
+### The pruning and quantization tools: sovereign-engine-v2
+
+The prune-and-quantize tooling lives in a separate repository,
+[SNAPKITTYWEST/sovereign-engine-v2](https://github.com/SNAPKITTYWEST/sovereign-engine-v2),
+read at commit
+[`d4bdfd2`](https://github.com/SNAPKITTYWEST/sovereign-engine-v2/commit/d4bdfd2a136ece421489813f309f89b363a38c42).
+The relevant code is `ModelPruner` in
+[`src/models/checkpoint_manager.py`](https://github.com/SNAPKITTYWEST/sovereign-engine-v2/blob/d4bdfd2a136ece421489813f309f89b363a38c42/src/models/checkpoint_manager.py)
+and the save → prune → quantize → upload sequence in
+[`src/models/checkpoint_workflow.py`](https://github.com/SNAPKITTYWEST/sovereign-engine-v2/blob/d4bdfd2a136ece421489813f309f89b363a38c42/src/models/checkpoint_workflow.py).
+
+- **Pruning:** L1 unstructured (`torch.nn.utils.prune.l1_unstructured`) on
+  every `Linear` and `Conv2d` weight, or structured pruning of whole output
+  channels by L2 norm (`ln_structured`, `n=2`, `dim=0`).
+- **Quantization:** PyTorch post-training *dynamic* quantization
+  (`torch.quantization.quantize_dynamic`, `qint8`).
+- **Checkpoints:** each one gets a SHA-256 seal written to `audit.jsonl`. A
+  caller that passes the previous seal chains them, and the workflow chains
+  the pruned checkpoint to its source.
+
+This is a different path from the GGUF formats above. It produces a PyTorch
+`state_dict` for CPU inference, not a GGUF or exl3 file that the CUDA backend
+can load.
+
+What it does today. These results come from running the code at `d4bdfd2`
+with PyTorch 2.14 (CPU) on a toy model and on the repository's own
+`CheckpointedMemoryHarness`:
+
+| Observation | Effect |
+|---|---|
+| `quantize_and_prune` raises `RuntimeError: Only Tensors created explicitly by the user (graph leaves) support the deepcopy protocol`. It prunes (which leaves `weight` as a computed tensor) and then calls `quantize_dynamic`, which deep-copies the model | The quantize step of the workflow fails on the memory harness. It succeeds only under `torch.no_grad()`, or once `remove_pruning_masks` has run |
+| `quantization_bits=4` runs the same `qint8` call as 8 | No 4-bit path exists yet. The code comment says so ("use 8-bit as fallback") |
+| `quantize_dynamic` has no dynamic kernel for `Conv2d` | Only `Linear` layers are quantized; `Conv2d` stays float32 |
+| The workflow prunes once, then `quantize_and_prune` prunes again at the same amount | 30% requested gives 51% actual sparsity |
+| `get_sparsity_ratio` reads `weight_orig` while pruning masks are attached | It reports 0% sparsity for a 30%-pruned model until `remove_pruning_masks` runs |
+| The "4× reduction" the workflow prints is computed as `baseline / 4`, not measured | The file size is never measured. With masks attached, the pruned checkpoint was *larger* than the float32 one (616,585 vs 309,845 bytes on the toy model) |
+| After the masks are removed and `Linear` is quantized, the toy model's `state_dict` shrinks from 309,909 to 82,309 bytes, and outputs differ from float32 by at most 0.0075 | The underlying technique works once it is called in the right order |
+
+PyTorch also marks `torch.ao.quantization` eager-mode quantization as
+deprecated in favour of `torchao`. Before any of this is used on Hilbert 4B,
+those problems need fixing in sovereign-engine-v2, and the result needs the
+measurement below. Until then, no Hilbert claim rests on it.
 
 ### How a quantized Hilbert 4B will be measured
 
